@@ -27,12 +27,12 @@ sha256sums=('SKIP')
 
 build() {
     cd "$pkgname"
-    cargo build --release --locked
+    cargo build --release
 }
 
 check() {
     cd "$pkgname"
-    cargo test --release --locked
+    cargo test --release
 }
 
 package() {

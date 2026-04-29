@@ -1,6 +1,6 @@
 [package]
 name = "anima-linux"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 [features]
@@ -17,7 +17,7 @@ gio = "0.18"
 rusqlite = "0.39.0"
 directories = "6.0.0"
 dirs = "5"
-image = { version = "0.25.10", features = ["gif"] }
+image = { version = "0.25.10", features = ["gif", "webp"] }
 sha2 = "0.11.0"
 libappindicator = { version = "0.9", optional = true }
 

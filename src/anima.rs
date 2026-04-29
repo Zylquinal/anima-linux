@@ -45,7 +45,7 @@ impl AnimaWindow {
         saturation: f64,
         hue: f64,
     ) -> Self {
-        // 2. Create a standard Window instead of an ApplicationWindow
+        // Create a standard Window instead of an ApplicationWindow
         let window = Window::builder()
             .title("Desktop Mascot")
             .decorated(false)

@@ -1,10 +1,12 @@
 use crate::ui::state::{AppContext, EditTarget};
 use crate::anima::AnimaWindow;
 use gtk::prelude::*;
-use gtk::{Box as GtkBox, Button, CheckButton, Image, Label, Orientation, Scale, ScrolledWindow, Adjustment};
+use gtk::{Box as GtkBox, Button, CheckButton, Image, Label, Orientation, Scale,
+          ScrolledWindow, Adjustment, Spinner};
 use std::rc::Rc;
 use gdk_pixbuf::PixbufAnimation;
 use std::cell::RefCell;
+use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 
 pub fn build(ctx: &AppContext, right_scroll: &ScrolledWindow, control_panel: &GtkBox) {
     let control_panel_c = control_panel.clone();
@@ -26,8 +28,9 @@ pub fn build(ctx: &AppContext, right_scroll: &ScrolledWindow, control_panel: &Gt
                 let a = anims.into_iter().find(|x| x.id == id).expect("Anim not found");
                 (a.name, a.file_path, crate::db::InstanceConfig {
                     id: -1, animation_id: id, scale: 1.0, opacity: 1.0, x: 0, y: 0,
-                    auto_spawn: false, mirror: false, flip_v: false, roll: 0.0, pitch: 0.0, yaw: 0.0, temperature: 0.0, contrast: 0.0,
-                    brightness: 0.0, saturation: 0.0, hue: 0.0
+                    auto_spawn: false, mirror: false, flip_v: false, roll: 0.0, pitch: 0.0,
+                    yaw: 0.0, temperature: 0.0, contrast: 0.0, brightness: 0.0,
+                    saturation: 0.0, hue: 0.0
                 })
             }
             EditTarget::Instance(id) => {
@@ -46,62 +49,158 @@ pub fn build(ctx: &AppContext, right_scroll: &ScrolledWindow, control_panel: &Gt
         title.set_xalign(0.0);
         control_panel_c.add(&title);
 
+        // Preview area
+        let preview_box = GtkBox::new(Orientation::Vertical, 4);
+
         let preview_img = Image::new();
-        preview_img.set_size_request(200, 200);
+        preview_img.set_size_request(-1, -1);
+
+        // Spinner shown while the preview is being computed on a background thread.
+        let preview_spinner = Spinner::new();
+        preview_spinner.set_no_show_all(true);
 
         let info_label = Label::new(None);
-        info_label.set_markup("<span size='small' color='gray'>Preview limited to 1.0x to save space. Actual spawn will be larger.</span>");
         info_label.set_no_show_all(true);
+        info_label.set_line_wrap(true);
+        info_label.set_max_width_chars(40);
+        info_label.set_xalign(0.0);
+
+        preview_box.add(&preview_img);
+        preview_box.add(&preview_spinner);
+        preview_box.add(&info_label);
+        control_panel_c.add(&preview_box);
 
         let preview_path_orig = file_path.clone();
 
-        let update_preview = {
-            let preview_img = preview_img.clone();
-            let preview_path_orig = preview_path_orig.clone();
-            let info_label = info_label.clone();
-            move |scale: f64, mirror: bool, flip_v: bool, roll: f64, pitch: f64, yaw: f64, temp: f64, contrast: f64, bright: f64, sat: f64, hue: f64| {
-                println!("Rendering preview...");
+        // Read natural dimensions once (cheap, for fit-scale computation).
+        const PREVIEW_MAX_PX: u32 = 350;
+        let (nat_w, nat_h): (u32, u32) = PixbufAnimation::from_file(&preview_path_orig)
+            .ok()
+            .and_then(|a| a.static_image().map(|p| (p.width() as u32, p.height() as u32)))
+            .unwrap_or((0, 0));
 
-                if scale > 1.0 {
+        // Generation counter – incremented on every preview request.
+        // The poll callback compares its captured generation against this; if they
+        // differ the result is discarded (newer request already in flight).
+        let preview_gen: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
+
+        // Tracks the active poll SourceId so we can cancel it when a new preview
+        // request supersedes the previous one before it has finished.
+        let poll_source: Rc<RefCell<Option<gtk::glib::SourceId>>> = Rc::new(RefCell::new(None));
+
+        // update_preview: non-blocking. Computation runs on a background thread;
+        // result is delivered via std::sync::mpsc polled with timeout_add_local.
+        let update_preview = {
+            let preview_img   = preview_img.clone();
+            let spinner       = preview_spinner.clone();
+            let info_label    = info_label.clone();
+            let gen_ref       = preview_gen.clone();
+            let poll_src_ref  = poll_source.clone();
+            let path_for_prev = preview_path_orig.clone();
+            move |scale: f64, mirror: bool, flip_v: bool,
+                  roll: f64, pitch: f64, yaw: f64,
+                  temp: f64, contrast: f64, bright: f64, sat: f64, hue: f64| {
+                // Increment generation: the poll closure captures this value and
+                // will discard the result if a newer request arrived in the meantime.
+                let this_gen = gen_ref.fetch_add(1, Ordering::SeqCst) + 1;
+
+                // Cancel any still-running poll from a previous request.
+                if let Some(id) = poll_src_ref.borrow_mut().take() { id.remove(); }
+
+                // Compute fit-scale and update the info label (fast, on main thread).
+                let max_dim = nat_w.max(nat_h).max(1) as f64;
+                let fit_scale = (PREVIEW_MAX_PX as f64 / max_dim).min(scale);
+                let preview_scale = scale.min(fit_scale);
+                let is_too_big = fit_scale < scale - 0.005;
+                let is_above_1 = scale > 1.005;
+
+                if is_too_big || is_above_1 {
+                    let msg = if is_too_big {
+                        format!("Preview fit to {}px  ·  Actual: {}×{}px",
+                            PREVIEW_MAX_PX,
+                            (nat_w as f64 * scale) as u32,
+                            (nat_h as f64 * scale) as u32)
+                    } else {
+                        format!("Preview limited to 1.0×  ·  Actual: {}×{}px",
+                            (nat_w as f64 * scale) as u32,
+                            (nat_h as f64 * scale) as u32)
+                    };
+                    info_label.set_markup(&format!("<span size='small' color='gray'>{msg}</span>"));
                     info_label.show();
                 } else {
                     info_label.hide();
                 }
 
-                let preview_scale = scale.min(1.0);
-                let unchanged = (preview_scale - 1.0).abs() < 0.01 && !mirror && !flip_v && roll.abs() < 0.01 && pitch.abs() < 0.01 && yaw.abs() < 0.01 && temp.abs() < 0.01 && contrast.abs() < 0.01 && bright.abs() < 0.01 && sat.abs() < 0.01 && hue.abs() < 0.01;
+                let unchanged = !is_too_big
+                    && (preview_scale - 1.0).abs() < 0.01
+                    && !mirror && !flip_v
+                    && roll.abs() < 0.01 && pitch.abs() < 0.01 && yaw.abs() < 0.01
+                    && temp.abs() < 0.01 && contrast.abs() < 0.01 && bright.abs() < 0.01
+                    && sat.abs() < 0.01 && hue.abs() < 0.01;
 
-                if unchanged {
-                    match PixbufAnimation::from_file(&preview_path_orig) {
-                        Ok(pix) => {
-                            preview_img.set_from_animation(&pix);
-                            preview_img.show();
-                        }
-                        Err(e) => eprintln!("Failed to load preview GIF: {}", e),
-                    }
-                } else {
-                    let data = crate::anima_resize::process_gif_in_memory(
-                        &preview_path_orig, preview_scale, mirror, flip_v, roll, pitch, yaw, temp, contrast, bright, sat, hue
-                    );
+                // Show spinner, hide old image while background work runs.
+                preview_img.hide();
+                spinner.start();
+                spinner.show();
 
-                    let loader = gdk_pixbuf::PixbufLoader::with_type("gif").unwrap();
-                    if let Err(e) = loader.write(&data) {
-                        eprintln!("Failed to write to PixbufLoader: {}", e);
-                    }
-                    let _ = loader.close();
-
-                    if let Some(anim) = loader.animation() {
-                        preview_img.set_from_animation(&anim);
-                        preview_img.show();
+                // Background thread
+                let (tx, rx) = std::sync::mpsc::channel::<Option<Vec<u8>>>();
+                let path = path_for_prev.clone();
+                std::thread::spawn(move || {
+                    let data: Option<Vec<u8>> = if unchanged {
+                        std::fs::read(&path).ok()
                     } else {
-                        eprintln!("Failed to parse preview GIF from memory");
-                    }
-                }
+                        Some(crate::anima_resize::process_gif_in_memory(
+                            &path, preview_scale, mirror, flip_v,
+                            roll, pitch, yaw, temp, contrast, bright, sat, hue,
+                        ))
+                    };
+                    tx.send(data).ok();
+                });
+
+                // Poll result every ~16 ms on the main thread.
+                let preview_img_p = preview_img.clone();
+                let spinner_p     = spinner.clone();
+                let gen_check     = gen_ref.clone();
+                let poll_src_p    = poll_src_ref.clone();
+                let rx_cell       = RefCell::new(rx);
+                let id = gtk::glib::timeout_add_local(
+                    std::time::Duration::from_millis(16),
+                    move || {
+                        use std::sync::mpsc::TryRecvError;
+                        match rx_cell.borrow_mut().try_recv() {
+                            Ok(data) => {
+                                // Only apply result if still the current generation.
+                                if gen_check.load(Ordering::SeqCst) == this_gen {
+                                    spinner_p.stop();
+                                    spinner_p.hide();
+                                    if let Some(bytes) = data {
+                                        let loader = gdk_pixbuf::PixbufLoader::with_type("gif").unwrap();
+                                        loader.write(&bytes).ok();
+                                        loader.close().ok();
+                                        if let Some(anim) = loader.animation() {
+                                            preview_img_p.set_from_animation(&anim);
+                                            preview_img_p.show();
+                                        }
+                                    }
+                                }
+                                *poll_src_p.borrow_mut() = None;
+                                gtk::glib::ControlFlow::Break
+                            }
+                            Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+                            Err(_) => {
+                                *poll_src_p.borrow_mut() = None;
+                                gtk::glib::ControlFlow::Break
+                            }
+                        }
+                    },
+                );
+                *poll_src_ref.borrow_mut() = Some(id);
             }
         };
-        control_panel_c.add(&preview_img);
-        control_panel_c.add(&info_label);
 
+
+        // Sliders
         let grid = gtk::Grid::new();
         grid.set_row_spacing(10);
         grid.set_column_spacing(20);
@@ -165,8 +264,9 @@ pub fn build(ctx: &AppContext, right_scroll: &ScrolledWindow, control_panel: &Gt
 
         control_panel_c.add(&grid);
 
+        // Live-update debounce
         let live_update_enabled = state.borrow().db.get_live_update_enabled().unwrap_or(true);
-        let live_update_delay = state.borrow().db.get_live_update_delay().unwrap_or(300);
+        let live_update_delay   = state.borrow().db.get_live_update_delay().unwrap_or(300);
 
         let debounce_id = Rc::new(RefCell::new(None::<gtk::glib::SourceId>));
         let live_update = {
@@ -185,11 +285,14 @@ pub fn build(ctx: &AppContext, right_scroll: &ScrolledWindow, control_panel: &Gt
                 let t_v = t.value(); let c_v = c.value(); let b_v = b.value();
                 let s_v = s.value(); let h_v = h.value();
                 let db_id_inner = db_id_ref.clone();
-                let id = gtk::glib::timeout_add_local(std::time::Duration::from_millis(live_update_delay), move || {
-                    up_p(sl_v, mir_v, fv_v, ro_v, pi_v, ya_v, t_v, c_v, b_v, s_v, h_v);
-                    *db_id_inner.borrow_mut() = None;
-                    gtk::glib::ControlFlow::Break
-                });
+                let id = gtk::glib::timeout_add_local(
+                    std::time::Duration::from_millis(live_update_delay),
+                    move || {
+                        up_p(sl_v, mir_v, fv_v, ro_v, pi_v, ya_v, t_v, c_v, b_v, s_v, h_v);
+                        *db_id_inner.borrow_mut() = None;
+                        gtk::glib::ControlFlow::Break
+                    },
+                );
                 *db_id_ref.borrow_mut() = Some(id);
             }
         };
@@ -206,21 +309,38 @@ pub fn build(ctx: &AppContext, right_scroll: &ScrolledWindow, control_panel: &Gt
         s_adj.connect_value_changed({let lu = live_update.clone(); move |_| lu()});
         h_adj.connect_value_changed({let lu = live_update.clone(); move |_| lu()});
 
-        update_preview(config.scale, config.mirror, config.flip_v, config.roll, config.pitch, config.yaw, config.temperature, config.contrast, config.brightness, config.saturation, config.hue);
+        // Initial preview render.
+        update_preview(
+            config.scale, config.mirror, config.flip_v,
+            config.roll, config.pitch, config.yaw,
+            config.temperature, config.contrast, config.brightness,
+            config.saturation, config.hue,
+        );
 
+        // Action buttons
         let action_box = GtkBox::new(Orientation::Horizontal, 10);
-        let apply_btn = Button::with_label("Apply Changes");
-        let spawn_btn = Button::with_label("Spawn with Settings");
+        let apply_btn  = Button::with_label("Apply Changes");
+        let spawn_btn  = Button::with_label("Spawn with Settings");
+
+        // Spinner shown while the GIF is being pre-computed
+        let action_spinner = Spinner::new();
+        action_spinner.set_no_show_all(true);
+
         match target.clone() {
-            EditTarget::Library(_) => action_box.add(&spawn_btn),
-            EditTarget::Instance(_) => action_box.add(&apply_btn),
+            EditTarget::Library(_) => {
+                action_box.add(&spawn_btn);
+            }
+            EditTarget::Instance(_) => {
+                action_box.add(&apply_btn);
+            }
         }
+        action_box.add(&action_spinner);
         control_panel_c.add(&action_box);
 
-        let state_c = state.clone();
+        let state_c   = state.clone();
         let refresh_a = refresh_active_spawns.clone();
-        let name_c = name.clone();
-        let path_c = file_path.clone();
+        let name_c    = name.clone();
+        let path_c    = file_path.clone();
 
         let effective_target: Rc<RefCell<EditTarget>> = Rc::new(RefCell::new(target.clone()));
         let title_lbl = title.clone();
@@ -228,28 +348,31 @@ pub fn build(ctx: &AppContext, right_scroll: &ScrolledWindow, control_panel: &Gt
         let ctx_c2 = ctx_c.clone();
         let on_apply = {
             let effective_target = effective_target.clone();
+            let apply_btn_c      = apply_btn.clone();
+            let spawn_btn_c      = spawn_btn.clone();
+            let action_spinner_c = action_spinner.clone();
             move || {
-                let mirror = mirror_check.is_active();
-                let flip_v = flip_v_check.is_active();
-                let roll = r_adj.value();
-                let pitch = p_adj.value();
-                let yaw = y_adj.value();
-                let scale = sl_adj.value();
+                let mirror  = mirror_check.is_active();
+                let flip_v  = flip_v_check.is_active();
+                let roll    = r_adj.value();
+                let pitch   = p_adj.value();
+                let yaw     = y_adj.value();
+                let scale   = sl_adj.value();
                 let opacity = op_adj.value();
-                let temp = t_adj.value();
-                let cont = c_adj.value();
-                let bright = b_adj.value();
-                let sat = s_adj.value();
-                let hue = h_adj.value();
-                let auto = auto_spawn_check.is_active();
+                let temp    = t_adj.value();
+                let cont    = c_adj.value();
+                let bright  = b_adj.value();
+                let sat     = s_adj.value();
+                let hue     = h_adj.value();
+                let auto    = auto_spawn_check.is_active();
 
                 let mut st = state_c.borrow_mut();
 
-                let db_id = match *effective_target.borrow() {
+                let current_target = effective_target.borrow().clone();
+                let db_id = match current_target {
                     EditTarget::Instance(id) => id,
                     EditTarget::Library(anim_id) => {
                         let id = st.db.insert_instance(anim_id, scale, opacity, 0, 0, auto).unwrap();
-                        // Promote to Instance so subsequent applies update, not insert.
                         *effective_target.borrow_mut() = EditTarget::Instance(id);
                         title_lbl.set_markup(&format!(
                             "<span size='large' weight='bold'>Active Instance - {}</span>",
@@ -266,6 +389,7 @@ pub fn build(ctx: &AppContext, right_scroll: &ScrolledWindow, control_panel: &Gt
                 let _ = st.db.update_instance_editing(db_id, temp, cont, bright, sat, hue);
                 let _ = st.db.update_instance_opacity(db_id, opacity);
 
+                // Capture current position so the re-spawned mascot stays in place.
                 let mut spawn_x = 0i32;
                 let mut spawn_y = 0i32;
                 if let Some(idx) = st.animas.iter().position(|a| a.instance_db_id == db_id) {
@@ -281,19 +405,76 @@ pub fn build(ctx: &AppContext, right_scroll: &ScrolledWindow, control_panel: &Gt
 
                 let _ = st.db.update_instance_position(db_id, spawn_x, spawn_y);
 
+                // Pre-compute counter and global opacity on the main thread
+                // (state is not Send so we can't access it from the background thread).
                 let (counter, g_opacity) = {
                     st.instance_counter += 1;
                     (st.instance_counter, st.global_opacity)
                 };
                 drop(st);
 
-                let anima = AnimaWindow::new(
-                    counter, db_id, name_c.clone(), &path_c,
-                    scale, opacity * g_opacity, spawn_x, spawn_y,
-                    mirror, flip_v, roll, pitch, yaw, temp, cont, bright, sat, hue
+                // Disable buttons and show spinner while the GIF cache is warmed.
+                apply_btn_c.set_sensitive(false);
+                spawn_btn_c.set_sensitive(false);
+                action_spinner_c.start();
+                action_spinner_c.show();
+
+                // Background thread: pre-compute (warm) the processed GIF cache.
+                // AnimaWindow::new() will then return immediately from cache.
+                let (tx, rx) = std::sync::mpsc::channel::<()>();
+                {
+                    let path = path_c.clone();
+                    std::thread::spawn(move || {
+                        crate::anima_resize::ensure_processed_gif(
+                            &path, scale, mirror, flip_v,
+                            roll, pitch, yaw, temp, cont, bright, sat, hue,
+                        );
+                        tx.send(()).ok();
+                    });
+                }
+
+                // Poll the channel every ~16 ms on the main thread.
+                let ctx_poll      = ctx_c2.clone();
+                let refresh_poll  = refresh_a.clone();
+                let name_poll     = name_c.clone();
+                let path_poll     = path_c.clone();
+                let apply_btn_p   = apply_btn_c.clone();
+                let spawn_btn_p   = spawn_btn_c.clone();
+                let spinner_p     = action_spinner_c.clone();
+                let rx_cell       = RefCell::new(rx);
+                gtk::glib::timeout_add_local(
+                    std::time::Duration::from_millis(16),
+                    move || {
+                        use std::sync::mpsc::TryRecvError;
+                        match rx_cell.borrow_mut().try_recv() {
+                            Ok(()) => {
+                                // Cache is ready – create the window on the main thread.
+                                let anima = AnimaWindow::new(
+                                    counter, db_id, name_poll.clone(), &path_poll,
+                                    scale, opacity * g_opacity, spawn_x, spawn_y,
+                                    mirror, flip_v, roll, pitch, yaw,
+                                    temp, cont, bright, sat, hue,
+                                );
+                                crate::ui::state::register_anima_window(&ctx_poll, anima);
+                                if let Some(f) = refresh_poll.borrow().as_ref() { f(); }
+
+                                spinner_p.stop();
+                                spinner_p.hide();
+                                apply_btn_p.set_sensitive(true);
+                                spawn_btn_p.set_sensitive(true);
+                                gtk::glib::ControlFlow::Break
+                            }
+                            Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
+                            Err(_) => {
+                                spinner_p.stop();
+                                spinner_p.hide();
+                                apply_btn_p.set_sensitive(true);
+                                spawn_btn_p.set_sensitive(true);
+                                gtk::glib::ControlFlow::Break
+                            }
+                        }
+                    },
                 );
-                crate::ui::state::register_anima_window(&ctx_c2, anima);
-                if let Some(f) = refresh_a.borrow().as_ref() { f(); }
             }
         };
 

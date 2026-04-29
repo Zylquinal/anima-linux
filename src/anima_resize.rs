@@ -1,8 +1,101 @@
 use std::path::PathBuf;
 use sha2::{Sha256, Digest};
 use std::fs::File;
-use image::codecs::gif::{GifDecoder, GifEncoder};
+use image::codecs::gif::{GifDecoder, GifEncoder, Repeat};
 use image::{AnimationDecoder, Frame, imageops::FilterType, DynamicImage};
+
+/// Convert any supported file into an animated GIF stored at `dest`.
+///
+/// | Input              | Strategy                                          |
+/// |--------------------|---------------------------------------------------|
+/// | `.gif`             | Copy verbatim                                     |
+/// | `.webp`            | Animated > re-encode frames; static > 1-frame GIF |
+/// | image (png/jpg/…)  | Load via `image` crate > 1-frame GIF              |
+/// | video (mp4/mkv/…)  | `ffmpeg` subprocess > GIF                         |
+pub fn import_as_gif(src: &std::path::Path, dest: &std::path::Path) -> Result<(), String> {
+    let ext = src.extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    match ext.as_str() {
+        "gif" => std::fs::copy(src, dest)
+            .map(|_| ())
+            .map_err(|e| format!("Copy failed: {e}")),
+
+        "webp" => import_webp_as_gif(src, dest),
+
+        "mp4" | "mkv" | "webm" | "avi" | "mov" | "flv" | "m4v" | "wmv" | "ts" | "ogv" => {
+            import_video_ffmpeg(src, dest)
+        }
+
+        _ => import_static_image_as_gif(src, dest),
+    }
+}
+
+fn import_webp_as_gif(src: &std::path::Path, dest: &std::path::Path) -> Result<(), String> {
+    use image::codecs::webp::WebPDecoder;
+
+    // Try animated-WebP path first.
+    let try_animated = (|| -> Result<Vec<image::Frame>, String> {
+        let file = File::open(src).map_err(|e| format!("Open failed: {e}"))?;
+        let decoder = WebPDecoder::new(std::io::BufReader::new(file))
+            .map_err(|e| format!("WebP decode error: {e}"))?;
+        decoder.into_frames()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("Frame read error: {e}"))
+    })();
+
+    match try_animated {
+        Ok(frames) if frames.len() > 1 => {
+            // Animated WebP
+            let mut out = File::create(dest).map_err(|e| format!("Create failed: {e}"))?;
+            let mut encoder = GifEncoder::new(&mut out);
+            encoder.set_repeat(Repeat::Infinite)
+                .map_err(|e| format!("Set repeat failed: {e}"))?;
+            for frame in frames {
+                encoder.encode_frame(frame)
+                    .map_err(|e| format!("Encode error: {e}"))?;
+            }
+            Ok(())
+        }
+        // Single frame or decode error
+        _ => import_static_image_as_gif(src, dest),
+    }
+}
+
+
+fn import_static_image_as_gif(src: &std::path::Path, dest: &std::path::Path) -> Result<(), String> {
+    let img = image::open(src).map_err(|e| format!("Failed to open image: {e}"))?;
+    let rgba = img.to_rgba8();
+    let mut out = File::create(dest).map_err(|e| format!("Create failed: {e}"))?;
+    let mut encoder = GifEncoder::new(&mut out);
+    encoder.set_repeat(Repeat::Infinite)
+        .map_err(|e| format!("Set repeat failed: {e}"))?;
+    encoder.encode_frame(Frame::new(rgba))
+        .map_err(|e| format!("Encode error: {e}"))
+}
+
+fn import_video_ffmpeg(src: &std::path::Path, dest: &std::path::Path) -> Result<(), String> {
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-i", src.to_str().unwrap_or(""),
+            "-vf", "fps=15,scale='min(480,iw)':-1:flags=lanczos",
+            "-loop", "0",
+            "-y",
+            dest.to_str().unwrap_or(""),
+        ])
+        .status()
+        .map_err(|e| format!("ffmpeg launch failed: {e}\nMake sure ffmpeg is installed."))?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("ffmpeg exited with code {status}.\nCheck that the file is a valid video."))
+    }
+}
+
+
 
 pub fn get_processed_gif_path(
     orig_path: &str,
@@ -125,11 +218,49 @@ fn process_gif_frames<W: std::io::Write>(
     hue: f64,
     writer: &mut W,
 ) {
-    let file = File::open(orig_path).unwrap();
-    let buf_reader = std::io::BufReader::new(file);
-    let decoder = GifDecoder::new(buf_reader).unwrap();
-    let frames = decoder.into_frames().collect::<Result<Vec<_>, _>>().unwrap();
+    // Detect format so we can handle non-GIF sources (e.g. .webp paths that
+    // were imported before the normalise-to-GIF logic was added, or any other
+    // image format the user managed to get into the DB).
+    let ext = std::path::Path::new(orig_path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    let frames: Vec<Frame> = if ext == "gif" {
+        let file = File::open(orig_path).unwrap();
+        let buf_reader = std::io::BufReader::new(file);
+        match GifDecoder::new(buf_reader) {
+            Ok(decoder) => decoder.into_frames()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap_or_default(),
+            Err(e) => {
+                eprintln!("GIF decode failed for {orig_path}: {e}");
+                vec![]
+            }
+        }
+    } else {
+        // Static / other animated image — load first frame via image crate.
+        match image::open(orig_path) {
+            Ok(img) => {
+                let delay = image::Delay::from_numer_denom_ms(100, 1);
+                vec![Frame::from_parts(img.to_rgba8(), 0, 0, delay)]
+            }
+            Err(e) => {
+                eprintln!("Image decode failed for {orig_path}: {e}");
+                vec![]
+            }
+        }
+    };
+
+    if frames.is_empty() {
+        eprintln!("No frames decoded from {orig_path}, skipping encode.");
+        return;
+    }
+
     let mut encoder = GifEncoder::new(writer);
+    encoder.set_repeat(Repeat::Infinite).ok();
+
 
     for frame in frames {
         let delay = frame.delay();

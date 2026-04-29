@@ -36,7 +36,7 @@ pub fn build_ui(app: &Application) {
 
     let window = ApplicationWindow::builder()
         .application(app)
-        .title("Anima Advanced Management")
+        .title("Anima Management")
         .default_width(1000)
         .default_height(800)
         .build();
@@ -89,7 +89,7 @@ pub fn build_ui(app: &Application) {
 
     let opacity_box = GtkBox::new(Orientation::Vertical, 2);
     opacity_box.set_margin(5);
-    opacity_box.add(&Label::new(Some("Global Temp Opacity")));
+    opacity_box.add(&Label::new(Some("Global Opacity")));
     let opacity_adj = Adjustment::new(1.0, 0.1, 1.0, 0.05, 0.0, 0.0);
     let opacity_scale = Scale::new(Orientation::Horizontal, Some(&opacity_adj));
     opacity_box.add(&opacity_scale);

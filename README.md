@@ -3,6 +3,7 @@
 Anima-Linux is a powerful, highly-customizable desktop mascot application for Linux. It allows you to spawn, manage, and interact with animated mascots right on your desktop, with full support for Wayland and X11 transparent windows.
 
 ![Anima-Linux Screenshot](assets/app_image.png)
+<img width="2560" height="1438" alt="image" src="https://github.com/user-attachments/assets/e4f89765-b530-4060-9381-9cae33617629" />
 
 ## Features
 

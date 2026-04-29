@@ -1,0 +1,13 @@
+# Project-level Cargo configuration.
+#
+# Some setup defaults to using `rust-lld` (LLVM's linker) for
+# all builds. This is generally faster, but `lld` has a known incompatibility
+# with static C archives produced by build scripts (e.g. the bundled SQLite in
+# `rusqlite` with the `bundled` feature): lld silently fails to pull in the
+# symbols from `libsqlite3.a`, leading to `undefined symbol: sqlite3_*` errors.
+#
+# Pinning to the system `cc` linker (GCC) fixes this for all build targets
+# without removing any other optimisations.
+[target.x86_64-unknown-linux-gnu]
+linker = "cc"
+rustflags = ["-C", "link-arg=-fuse-ld=bfd"]

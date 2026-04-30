@@ -377,6 +377,14 @@ impl Db {
         Ok(())
     }
 
+    pub fn rename_animation(&self, id: i32, new_name: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE animations SET name = ?1 WHERE id = ?2",
+            (new_name, id),
+        )?;
+        Ok(())
+    }
+
     pub fn clear_all_data(&self) -> Result<()> {
         self.conn.execute("DELETE FROM instances", [])?;
         self.conn.execute("DELETE FROM animations", [])?;

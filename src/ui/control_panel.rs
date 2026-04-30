@@ -57,7 +57,7 @@ pub fn build(ctx: &AppContext, right_scroll: &ScrolledWindow, control_panel: &Gt
 
         // Spinner shown while the preview is being computed on a background thread.
         let preview_spinner = Spinner::new();
-        preview_spinner.set_no_show_all(true);
+        preview_spinner.set_opacity(0.0);
 
         let info_label = Label::new(None);
         info_label.set_no_show_all(true);
@@ -139,9 +139,9 @@ pub fn build(ctx: &AppContext, right_scroll: &ScrolledWindow, control_panel: &Gt
                     && sat.abs() < 0.01 && hue.abs() < 0.01;
 
                 // Show spinner, hide old image while background work runs.
-                preview_img.hide();
+                preview_img.set_opacity(0.0);
                 spinner.start();
-                spinner.show();
+                spinner.set_opacity(1.0);
 
                 // Background thread
                 let (tx, rx) = std::sync::mpsc::channel::<Option<Vec<u8>>>();
@@ -173,14 +173,14 @@ pub fn build(ctx: &AppContext, right_scroll: &ScrolledWindow, control_panel: &Gt
                                 // Only apply result if still the current generation.
                                 if gen_check.load(Ordering::SeqCst) == this_gen {
                                     spinner_p.stop();
-                                    spinner_p.hide();
+                                    spinner_p.set_opacity(0.0);
                                     if let Some(bytes) = data {
                                         let loader = gdk_pixbuf::PixbufLoader::with_type("gif").unwrap();
                                         loader.write(&bytes).ok();
                                         loader.close().ok();
                                         if let Some(anim) = loader.animation() {
                                             preview_img_p.set_from_animation(&anim);
-                                            preview_img_p.show();
+                                            preview_img_p.set_opacity(1.0);
                                         }
                                     }
                                 }
@@ -249,13 +249,22 @@ pub fn build(ctx: &AppContext, right_scroll: &ScrolledWindow, control_panel: &Gt
         let (h_l, h_s, h_adj, h_r) = create_slider("Hue", -180.0, 180.0, config.hue, 1.0);
         grid.attach(&h_l, 0, 7, 1, 1); grid.attach(&h_s, 1, 7, 1, 1); grid.attach(&h_r, 2, 7, 1, 1);
 
-        let (r_l, r_s, r_adj, r_r) = create_slider("Roll (Z)", -180.0, 180.0, config.roll, 5.0);
+        let (r_l, r_s, r_adj, r_r) = create_slider("Roll (Z)", 0.0, 360.0, config.roll.rem_euclid(360.0), 5.0);
+        for deg in [90.0_f64, 180.0, 270.0, 360.0] {
+            r_s.add_mark(deg, gtk::PositionType::Bottom, None);
+        }
         grid.attach(&r_l, 0, 8, 1, 1); grid.attach(&r_s, 1, 8, 1, 1); grid.attach(&r_r, 2, 8, 1, 1);
 
         let (p_l, p_s, p_adj, p_r) = create_slider("Pitch (X)", -90.0, 90.0, config.pitch, 5.0);
+        for deg in [-90.0_f64, -45.0, 0.0, 45.0, 90.0] {
+            p_s.add_mark(deg, gtk::PositionType::Bottom, None);
+        }
         grid.attach(&p_l, 0, 9, 1, 1); grid.attach(&p_s, 1, 9, 1, 1); grid.attach(&p_r, 2, 9, 1, 1);
 
         let (y_l, y_s, y_adj, y_r) = create_slider("Yaw (Y)", -90.0, 90.0, config.yaw, 5.0);
+        for deg in [-90.0_f64, -45.0, 0.0, 45.0, 90.0] {
+            y_s.add_mark(deg, gtk::PositionType::Bottom, None);
+        }
         grid.attach(&y_l, 0, 10, 1, 1); grid.attach(&y_s, 1, 10, 1, 1); grid.attach(&y_r, 2, 10, 1, 1);
 
         let auto_spawn_check = CheckButton::with_label("Auto-spawn");
@@ -324,7 +333,7 @@ pub fn build(ctx: &AppContext, right_scroll: &ScrolledWindow, control_panel: &Gt
 
         // Spinner shown while the GIF is being pre-computed
         let action_spinner = Spinner::new();
-        action_spinner.set_no_show_all(true);
+        action_spinner.set_opacity(0.0);
 
         match target.clone() {
             EditTarget::Library(_) => {
@@ -417,7 +426,7 @@ pub fn build(ctx: &AppContext, right_scroll: &ScrolledWindow, control_panel: &Gt
                 apply_btn_c.set_sensitive(false);
                 spawn_btn_c.set_sensitive(false);
                 action_spinner_c.start();
-                action_spinner_c.show();
+                action_spinner_c.set_opacity(1.0);
 
                 // Background thread: pre-compute (warm) the processed GIF cache.
                 // AnimaWindow::new() will then return immediately from cache.
@@ -459,7 +468,7 @@ pub fn build(ctx: &AppContext, right_scroll: &ScrolledWindow, control_panel: &Gt
                                 if let Some(f) = refresh_poll.borrow().as_ref() { f(); }
 
                                 spinner_p.stop();
-                                spinner_p.hide();
+                                spinner_p.set_opacity(0.0);
                                 apply_btn_p.set_sensitive(true);
                                 spawn_btn_p.set_sensitive(true);
                                 gtk::glib::ControlFlow::Break
@@ -467,7 +476,7 @@ pub fn build(ctx: &AppContext, right_scroll: &ScrolledWindow, control_panel: &Gt
                             Err(TryRecvError::Empty) => gtk::glib::ControlFlow::Continue,
                             Err(_) => {
                                 spinner_p.stop();
-                                spinner_p.hide();
+                                spinner_p.set_opacity(0.0);
                                 apply_btn_p.set_sensitive(true);
                                 spawn_btn_p.set_sensitive(true);
                                 gtk::glib::ControlFlow::Break

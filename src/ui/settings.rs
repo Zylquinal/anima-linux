@@ -22,9 +22,18 @@ fn enable_autostart() {
         .unwrap_or_else(|_| std::path::PathBuf::from("anima-linux"))
         .to_string_lossy()
         .to_string();
+
+    let exec_line = match crate::env_detect::detect() {
+        crate::env_detect::DisplayEnv::XWaylandExplicit
+        | crate::env_detect::DisplayEnv::XWaylandImplicit => {
+            format!("env GDK_BACKEND=x11 {}", exe)
+        }
+        _ => exe,
+    };
+
     let content = format!(
-        "[Desktop Entry]\nType=Application\nName=Anima\nExec={exe}\nHidden=false\nNoDisplay=false\nX-GNOME-Autostart-enabled=true\n",
-        exe = exe
+        "[Desktop Entry]\nType=Application\nName=Anima\nExec={exec}\nHidden=false\nNoDisplay=false\nX-GNOME-Autostart-enabled=true\n",
+        exec = exec_line
     );
     let _ = std::fs::write(dir.join(AUTOSTART_FILENAME), content);
 }

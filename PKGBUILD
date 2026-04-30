@@ -1,6 +1,6 @@
 # Maintainer: zylquinal <your-email@example.com>
 pkgname=anima-linux
-pkgver=0.1.1
+pkgver=0.1.2
 pkgrel=1
 pkgdesc="A desktop mascot manager for Linux"
 arch=('x86_64')
